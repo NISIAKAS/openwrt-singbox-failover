@@ -280,16 +280,26 @@ write_status() {
 
 status() {
 	local dataplane running="0"
+	local direct_health="null"
+	local proxy_health="null"
 
 	if [ -s "$STATUS_PATH" ]; then
 		if runtime_running; then
 			running="1"
 		fi
 		dataplane="$(dataplane_json)"
+		if [ -s "$WORK_DIR/last_direct.json" ]; then
+			direct_health="$(cat "$WORK_DIR/last_direct.json" 2>/dev/null || printf 'null')"
+		fi
+		if [ -s "$WORK_DIR/last_proxy.json" ]; then
+			proxy_health="$(cat "$WORK_DIR/last_proxy.json" 2>/dev/null || printf 'null')"
+		fi
 		jq \
 			--arg running "$running" \
 			--argjson dataplane "$dataplane" \
-			'.sing_box_running = ($running == "1") | .dataplane = $dataplane' "$STATUS_PATH"
+			--argjson direct_health "$direct_health" \
+			--argjson proxy_health "$proxy_health" \
+			'.sing_box_running = ($running == "1") | .dataplane = $dataplane | .direct_health = $direct_health | .proxy_health = $proxy_health' "$STATUS_PATH"
 	else
 		write_status "direct" "unknown" "unknown" "" 0 0 ""
 		cat "$STATUS_PATH"

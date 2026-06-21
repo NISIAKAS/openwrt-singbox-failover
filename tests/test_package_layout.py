@@ -91,6 +91,8 @@ class PackageLayoutTests(unittest.TestCase):
             self.assertIn(token, view)
         self.assertIn("direct_health", script)
         self.assertIn("proxy_health", script)
+        self.assertIn("last_direct.json", script)
+        self.assertIn("last_proxy.json", script)
         self.assertIn("Обновить статус", view)
 
     def test_status_dashboard_exposes_dataplane_state(self):
