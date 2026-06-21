@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-singbox-failover
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=NISIAKAS
 PKGARCH:=all
@@ -34,4 +34,3 @@ define Package/luci-app-singbox-failover/install
 endef
 
 $(eval $(call BuildPackage,luci-app-singbox-failover))
-

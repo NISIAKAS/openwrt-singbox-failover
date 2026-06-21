@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=singbox-failover
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=NISIAKAS
 PKGARCH:=all
@@ -38,5 +38,19 @@ define Package/singbox-failover/install
 	$(INSTALL_BIN) ./files/usr/bin/singbox-failover $(1)/usr/bin/singbox-failover
 endef
 
-$(eval $(call BuildPackage,singbox-failover))
+define Package/singbox-failover/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+/etc/init.d/singbox-failover stop >/dev/null 2>&1 || true
+/etc/init.d/singbox-failover disable >/dev/null 2>&1 || true
+exit 0
+endef
 
+define Package/singbox-failover/prerm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+/etc/init.d/singbox-failover stop >/dev/null 2>&1 || true
+exit 0
+endef
+
+$(eval $(call BuildPackage,singbox-failover))
