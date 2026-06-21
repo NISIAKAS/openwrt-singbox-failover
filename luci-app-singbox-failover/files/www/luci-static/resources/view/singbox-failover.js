@@ -32,6 +32,24 @@ function addAction(section, name, title, cmd, args) {
 	return option;
 }
 
+function helpBox(title, body, items) {
+	var children = [
+		E('div', { 'style': 'font-weight:700;margin-bottom:6px' }, title),
+		E('div', { 'style': 'opacity:.86;line-height:1.45' }, body)
+	];
+
+	if (Array.isArray(items) && items.length) {
+		children.push(E('ul', { 'style': 'margin:8px 0 0 18px;padding:0;line-height:1.45' },
+			items.map(function(item) {
+				return E('li', {}, item);
+			})));
+	}
+
+	return E('div', {
+		'style': 'border:1px solid var(--border-color-medium);border-radius:6px;padding:12px 14px;margin:0 0 14px 0;background:rgba(127,127,127,.07)'
+	}, children);
+}
+
 function healthSummary(health) {
 	if (!health)
 		return '-';
@@ -75,13 +93,13 @@ function modeName(mode) {
 function policyName(policy) {
 	switch (policy) {
 	case 'all_ok':
-		return 'все URL';
+		return 'все URL должны работать';
 	case 'quorum':
-		return 'кворум';
+		return 'минимум N URL';
 	case 'any_ok':
-		return 'любой URL';
+		return 'достаточно одного URL';
 	default:
-		return policy || 'любой URL';
+		return policy || 'достаточно одного URL';
 	}
 }
 
@@ -147,6 +165,24 @@ function dashboard(status) {
 	]);
 }
 
+function currentExplanation(status) {
+	var dataplane = status.dataplane || {};
+
+	if (!status.enabled)
+		return 'Сервис выключен. Правила маршрутизации не создаются, отдельный sing-box не запускается, интернет остается как был.';
+
+	if (status.current_mode == 'proxy')
+		return 'Сейчас выбранные сети должны идти через отдельный sing-box. Это видно по активным nft/ip rule и открытым портам 1702/1703.';
+
+	if (status.current_mode == 'direct')
+		return 'Сейчас выбранные сети идут напрямую через обычный WAN. В proxy сервис переключится только по выбранному режиму и порогам.';
+
+	if (dataplane.rules_active)
+		return 'Правила активны, но режим не определен. Проверь последний статус и ошибки ниже.';
+
+	return 'Сервис включен, но пока нет активного перенаправления. Нажми "Проверить direct" или "Запустить".';
+}
+
 function dataplaneRows(dataplane) {
 	dataplane = dataplane || {};
 
@@ -192,7 +228,7 @@ function healthRows(health) {
 
 	return E('table', { 'class': 'table' }, [
 		E('tr', {}, [
-			E('th', {}, 'Результат'),
+			E('th', {}, 'Статус'),
 			E('th', {}, _('HTTP')),
 			E('th', {}, _('URL'))
 		]),
@@ -223,6 +259,18 @@ return view.extend({
 
 		var o;
 
+		o = s.taboption('general', form.DummyValue, '_general_help', 'Схема работы');
+		o.rawhtml = true;
+		o.cfgvalue = function() {
+			return helpBox('Что делает этот сервис',
+				'Он не заменяет Podkop и не трогает его правила. Это отдельный failover: проверяет доступность direct через WAN и при сбое переводит только выбранные сети через отдельный sing-box.',
+				[
+					'Если "Включено" выключено, сервис ничего не меняет в маршрутизации.',
+					'В режиме "авто" переключение зависит от healthcheck URL и порогов ошибок.',
+					'ICMP/ping в MVP не проксируется, проверяется HTTP/HTTPS доступность.'
+				]);
+		};
+
 		o = s.taboption('general', form.Flag, 'enabled', 'Включено',
 			'Разрешает сервису работать. Если выключено, правила маршрутизации не создаются, отдельный sing-box не запускается.');
 		o.default = '0';
@@ -244,8 +292,8 @@ return view.extend({
 			return value !== 'loopback';
 		};
 
-		o = s.taboption('general', widgets.NetworkSelect, 'source_interfaces', 'Сети для переключения',
-			'Только трафик из выбранных сетей будет переведен через proxy при срабатывании failover.');
+		o = s.taboption('general', widgets.NetworkSelect, 'source_interfaces', 'Сети-источники',
+			'Выбери OpenWrt-интерфейсы, откуда брать клиентский трафик: например miners, guest или lan. Только эти сети будут переключаться через proxy.');
 		o.multiple = true;
 		o.placeholder = 'miners';
 		o.rmempty = false;
@@ -277,6 +325,18 @@ return view.extend({
 		o.default = '6';
 		o.rmempty = false;
 
+		o = s.taboption('outbound', form.DummyValue, '_outbound_help', 'Что вставлять');
+		o.rawhtml = true;
+		o.cfgvalue = function() {
+			return helpBox('Outbound - это один выход sing-box',
+				'Сюда вставляется не весь купленный V2Ray/Xray JSON, а один sing-box outbound object с полем "type": например vless, hysteria2, socks или shadowsocks.',
+				[
+					'Если outbound пустой или невалидный, proxy-режим не будет включен и трафик останется напрямую.',
+					'Этот экземпляр sing-box отдельный от Podkop и использует порты 1702/1703.',
+					'Позже можно добавить импорт полных конфигов, но сейчас MVP принимает raw outbound.'
+				]);
+		};
+
 		o = s.taboption('outbound', form.TextValue, 'outbound_json', 'Outbound JSON',
 			'Один sing-box outbound object: например VLESS Reality или Hysteria2. Не вставляй полный Xray/V2Ray config.');
 		o.rows = 18;
@@ -304,17 +364,29 @@ return view.extend({
 			return true;
 		};
 
+		o = s.taboption('healthchecks', form.DummyValue, '_health_help', 'Как читать проверку');
+		o.rawhtml = true;
+		o.cfgvalue = function() {
+			return helpBox('Healthcheck решает, доступен ли direct',
+				'Каждый URL проверяется принудительно через WAN-интерфейс. Если direct считается плохим несколько циклов подряд, авто-режим переключит выбранные сети в proxy.',
+				[
+					'После изменения списка нажми "Сохранить и применить", затем "Проверить direct".',
+					'Если один URL иногда блокируется, используй правило "достаточно одного URL".',
+					'Если нужно строго понимать, что вся группа доступна, используй "все URL должны работать" или "минимум N URL".'
+				]);
+		};
+
 		o = s.taboption('healthchecks', form.DynamicList, 'health_url', 'Healthcheck URL',
-			'Адреса, по которым проверяется direct-доступ. После изменения нажми "Проверить direct", чтобы сразу увидеть результат.');
+			'Адреса, по которым проверяется direct-доступ через WAN. Для белых списков выбирай URL, которые должны быть недоступны без proxy.');
 		o.datatype = 'url';
 		o.placeholder = 'https://www.gstatic.com/generate_204';
 		o.rmempty = false;
 
 		o = s.taboption('healthchecks', form.ListValue, 'health_policy', 'Правило оценки',
 			'Как считать итог проверки, если URL несколько.');
-		o.value('any_ok', 'любой URL работает');
-		o.value('all_ok', 'все URL работают');
-		o.value('quorum', 'работает минимум N URL');
+		o.value('any_ok', 'достаточно одного URL');
+		o.value('all_ok', 'все URL должны работать');
+		o.value('quorum', 'минимум N URL');
 		o.default = 'any_ok';
 		o.rmempty = false;
 
@@ -334,30 +406,50 @@ return view.extend({
 		o.rawhtml = true;
 		o.cfgvalue = function() {
 			return E('div', { 'class': 'cbi-section' }, [
+				helpBox('Понятное состояние', currentExplanation(status), [
+					'Direct - обычный интернет через WAN.',
+					'Proxy - выбранные сети отправляются в отдельный sing-box failover.',
+					'Правила маршрутизации активны только когда сервис реально перевел трафик в proxy.'
+				]),
 				dashboard(status),
-				E('p', {}, 'Режим сейчас: ' + modeName(status.current_mode)),
-				E('p', {}, 'Настроенный режим: ' + modeName(status.configured_mode)),
-				E('p', {}, 'Правило оценки healthcheck: ' + policyName(status.health_policy)),
-				E('p', {}, 'Direct: ' + healthSummary(status.direct_health)),
-				E('p', {}, 'Proxy: ' + healthSummary(status.proxy_health)),
-				E('p', {}, 'Счетчик ошибок direct: ' + (status.fail_count || 0)),
-				E('p', {}, 'Счетчик восстановления direct: ' + (status.recover_count || 0)),
-				E('p', {}, 'Последняя ошибка: ' + (status.last_error || '-')),
+				E('table', { 'class': 'table' }, [
+					E('tr', {}, [ E('th', {}, 'Параметр'), E('th', {}, 'Значение') ]),
+					E('tr', {}, [ E('td', {}, 'Режим сейчас'), E('td', {}, modeName(status.current_mode)) ]),
+					E('tr', {}, [ E('td', {}, 'Настроенный режим'), E('td', {}, modeName(status.configured_mode)) ]),
+					E('tr', {}, [ E('td', {}, 'Правило healthcheck'), E('td', {}, policyName(status.health_policy)) ]),
+					E('tr', {}, [ E('td', {}, 'Ошибок direct подряд'), E('td', {}, String(status.fail_count || 0)) ]),
+					E('tr', {}, [ E('td', {}, 'Успешных direct подряд'), E('td', {}, String(status.recover_count || 0)) ]),
+					E('tr', {}, [ E('td', {}, 'Последняя ошибка'), E('td', {}, status.last_error || '-') ])
+				]),
 				E('h4', {}, 'Правила и порты'),
 				dataplaneRows(status.dataplane),
 				E('h4', {}, 'Direct-проверки'),
 				healthRows(status.direct_health),
 				E('h4', {}, 'Proxy-проверки'),
 				healthRows(status.proxy_health),
-				E('h4', {}, 'Технический статус JSON'),
-				E('pre', {}, JSON.stringify(status, null, 2))
+				E('details', { 'style': 'margin-top:14px' }, [
+					E('summary', { 'style': 'cursor:pointer;font-weight:700' }, 'Технический JSON для диагностики'),
+					E('pre', { 'style': 'margin-top:10px;white-space:pre-wrap' }, JSON.stringify(status, null, 2))
+				])
 			]);
 		};
 
+		o = s.taboption('actions', form.DummyValue, '_actions_help', 'Что делают кнопки');
+		o.rawhtml = true;
+		o.cfgvalue = function() {
+			return helpBox('Действия применяются сразу',
+				'Сначала нажми "Сохранить и применить", если менял настройки. Потом используй кнопки ниже.',
+				[
+					'Запустить - стартует failover-демон. Если "Включено" выключено, демон выйдет без правил.',
+					'Проверить direct - сразу проверяет URL через WAN и обновляет статус.',
+					'Проверить proxy - проверяет доступность через локальный mixed proxy 127.0.0.1:1703, когда sing-box запущен.'
+				]);
+		};
+
 		addAction(s, '_refresh_status', 'Обновить статус', '/usr/bin/singbox-failover', [ 'status' ]);
-		addAction(s, '_start', _('Start'), '/etc/init.d/singbox-failover', [ 'start' ]);
-		addAction(s, '_stop', _('Stop'), '/etc/init.d/singbox-failover', [ 'stop' ]);
-		addAction(s, '_reload', _('Reload'), '/etc/init.d/singbox-failover', [ 'reload' ]);
+		addAction(s, '_start', 'Запустить', '/etc/init.d/singbox-failover', [ 'start' ]);
+		addAction(s, '_stop', 'Остановить', '/etc/init.d/singbox-failover', [ 'stop' ]);
+		addAction(s, '_reload', 'Перезапустить', '/etc/init.d/singbox-failover', [ 'reload' ]);
 		addAction(s, '_test_direct', 'Проверить direct', '/usr/bin/singbox-failover', [ 'test_direct' ]);
 		addAction(s, '_test_proxy', 'Проверить proxy', '/usr/bin/singbox-failover', [ 'test_proxy' ]);
 
