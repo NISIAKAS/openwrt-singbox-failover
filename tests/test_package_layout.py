@@ -80,6 +80,13 @@ class PackageLayoutTests(unittest.TestCase):
         self.assertIn("outbound_json", view)
         self.assertRegex(view, r"JSON\.parse")
 
+    def test_luci_view_uses_network_select_for_interfaces(self):
+        view = read("luci-app-singbox-failover/files/www/luci-static/resources/view/singbox-failover.js")
+        self.assertIn("require tools.widgets as widgets", view)
+        self.assertRegex(view, r"widgets\.NetworkSelect,\s*'wan_interface'")
+        self.assertRegex(view, r"widgets\.NetworkSelect,\s*'source_interfaces'")
+        self.assertIn("o.multiple = true", view)
+
 
 if __name__ == "__main__":
     unittest.main()

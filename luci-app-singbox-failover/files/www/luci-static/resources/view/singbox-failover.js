@@ -3,6 +3,7 @@
 'require form';
 'require fs';
 'require ui';
+'require tools.widgets as widgets';
 
 function parseStatus(raw) {
 	try {
@@ -65,14 +66,20 @@ return view.extend({
 		o.default = 'auto';
 		o.rmempty = false;
 
-		o = s.taboption('general', form.Value, 'wan_interface', _('WAN interface'));
+		o = s.taboption('general', widgets.NetworkSelect, 'wan_interface', _('WAN interface'));
 		o.default = 'wan';
 		o.rmempty = false;
+		o.filter = function(section_id, value) {
+			return value !== 'loopback';
+		};
 
-		o = s.taboption('general', form.DynamicList, 'source_interfaces', _('Source interfaces'));
-		o.datatype = 'uciname';
+		o = s.taboption('general', widgets.NetworkSelect, 'source_interfaces', _('Source interfaces'));
+		o.multiple = true;
 		o.placeholder = 'miners';
 		o.rmempty = false;
+		o.filter = function(section_id, value) {
+			return value !== 'loopback';
+		};
 
 		o = s.taboption('general', form.Value, 'check_interval', _('Check interval'));
 		o.datatype = 'uinteger';
@@ -150,4 +157,3 @@ return view.extend({
 		return m.render();
 	}
 });
-
