@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=singbox-failover
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=NISIAKAS
 PKGARCH:=all
@@ -41,6 +41,16 @@ endef
 define Package/singbox-failover/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
+changed=0
+uci -q get singbox_failover.main.health_policy >/dev/null || {
+	uci set singbox_failover.main.health_policy='any_ok'
+	changed=1
+}
+uci -q get singbox_failover.main.health_quorum >/dev/null || {
+	uci set singbox_failover.main.health_quorum='1'
+	changed=1
+}
+[ "$$changed" = "1" ] && uci commit singbox_failover
 /etc/init.d/singbox-failover stop >/dev/null 2>&1 || true
 /etc/init.d/singbox-failover disable >/dev/null 2>&1 || true
 exit 0

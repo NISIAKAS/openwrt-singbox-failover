@@ -149,6 +149,21 @@ pid_running() {
 	kill -0 "$pid" 2>/dev/null
 }
 
+runtime_pids() {
+	if command -v pgrep >/dev/null 2>&1; then
+		pgrep -f "sing-box run -c $CONFIG_PATH" 2>/dev/null || true
+	else
+		ps 2>/dev/null | awk -v config="$CONFIG_PATH" '$0 ~ /sing-box run/ && index($0, config) { print $1 }'
+	fi
+}
+
+runtime_running() {
+	if runtime_running; then
+		return 0
+	fi
+	[ -n "$(runtime_pids)" ]
+}
+
 dataplane_json() {
 	local nft_table="0"
 	local fwmark_rule="0"
@@ -212,7 +227,7 @@ write_status() {
 	local dataplane
 
 	ensure_work_dir
-	if pid_running; then
+	if runtime_running; then
 		running="1"
 	fi
 	if [ -s "$WORK_DIR/last_direct.json" ]; then
@@ -264,7 +279,7 @@ status() {
 	local dataplane running="0"
 
 	if [ -s "$STATUS_PATH" ]; then
-		if pid_running; then
+		if runtime_running; then
 			running="1"
 		fi
 		dataplane="$(dataplane_json)"
@@ -388,7 +403,7 @@ start_singbox() {
 	echo "$!" > "$PID_PATH"
 	sleep 1
 
-	if ! pid_running; then
+	if ! runtime_running; then
 		error="$(cat /tmp/singbox-failover-sing-box.log 2>/dev/null || true)"
 		write_status "direct" "unknown" "start_failed" "" 0 0 "$error"
 		log "sing-box instance failed to start; leaving traffic direct"
@@ -397,14 +412,27 @@ start_singbox() {
 }
 
 stop_singbox() {
-	local pid
+	local pid pids
 	if [ -s "$PID_PATH" ]; then
 		pid="$(cat "$PID_PATH" 2>/dev/null || true)"
 		if [ -n "$pid" ]; then
 			kill "$pid" 2>/dev/null || true
-			sleep 1
-			kill -9 "$pid" 2>/dev/null || true
 		fi
+	fi
+	pids="$(runtime_pids)"
+	if [ -n "$pids" ]; then
+		printf '%s\n' "$pids" | while IFS= read -r pid; do
+			[ -n "$pid" ] || continue
+			kill "$pid" 2>/dev/null || true
+		done
+	fi
+	sleep 1
+	pids="$(runtime_pids)"
+	if [ -n "$pids" ]; then
+		printf '%s\n' "$pids" | while IFS= read -r pid; do
+			[ -n "$pid" ] || continue
+			kill -9 "$pid" 2>/dev/null || true
+		done
 	fi
 	rm -f "$PID_PATH"
 }
@@ -601,7 +629,7 @@ test_proxy() {
 
 	proxy="http://127.0.0.1:$MIXED_PORT"
 
-	if ! pid_running; then
+	if ! runtime_running; then
 		start_singbox || {
 			jq -n '{ok: false, error: "sing-box instance is not running"}'
 			return 1

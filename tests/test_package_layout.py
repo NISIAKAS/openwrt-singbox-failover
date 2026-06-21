@@ -99,6 +99,8 @@ class PackageLayoutTests(unittest.TestCase):
 
         for token in ["dataplane_json", "rules_active", "fwmark_rule", "route_table_active"]:
             self.assertIn(token, script)
+        for token in ["runtime_pids", "runtime_running"]:
+            self.assertIn(token, script)
         for token in ["dashboard(status)", "Правила и порты", "statusCard", "dataplaneRows"]:
             self.assertIn(token, view)
 
