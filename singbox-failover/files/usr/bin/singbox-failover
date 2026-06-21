@@ -150,11 +150,14 @@ pid_running() {
 }
 
 runtime_pids() {
-	if command -v pgrep >/dev/null 2>&1; then
-		pgrep -f "sing-box run -c $CONFIG_PATH" 2>/dev/null || true
-	else
-		ps 2>/dev/null | awk -v config="$CONFIG_PATH" '$0 ~ /sing-box run/ && index($0, config) { print $1 }'
-	fi
+	ps 2>/dev/null | awk -v config="$CONFIG_PATH" '
+		$0 ~ /sing-box[ ]+run/ &&
+		index($0, config) &&
+		$0 !~ /awk/ &&
+		$0 !~ /ash -c/ &&
+		$0 !~ /\/bin\/sh -c/ {
+			print $1
+		}'
 }
 
 runtime_running() {
