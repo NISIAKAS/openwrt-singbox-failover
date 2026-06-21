@@ -161,7 +161,7 @@ runtime_pids() {
 }
 
 runtime_running() {
-	if runtime_running; then
+	if pid_running; then
 		return 0
 	fi
 	[ -n "$(runtime_pids)" ]
