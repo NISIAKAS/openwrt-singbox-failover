@@ -1,0 +1,10 @@
+*.apk
+*.ipk
+*.tar
+*.tar.*
+artifacts/
+build/
+sdk/
+__pycache__/
+*.pyc
+

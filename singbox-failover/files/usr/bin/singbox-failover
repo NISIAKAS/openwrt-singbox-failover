@@ -1,0 +1,610 @@
+#!/bin/sh
+
+set -u
+
+NAME="singbox-failover"
+WORK_DIR="/tmp/singbox-failover"
+CONFIG_PATH="$WORK_DIR/config.json"
+PID_PATH="$WORK_DIR/sing-box.pid"
+STATUS_PATH="$WORK_DIR/status.json"
+TPROXY_PORT=1702
+MIXED_PORT=1703
+MARK=0x00200000
+ROUTE_TABLE=206
+ROUTE_TABLE_NAME="singbox_failover"
+TABLE_NAME=singbox_failover
+RULE_PRIORITY=106
+
+log() {
+	logger -t "$NAME" "$*"
+}
+
+uci_get() {
+	local option="$1"
+	local default="${2:-}"
+	uci -q get "singbox_failover.main.$option" 2>/dev/null || printf '%s\n' "$default"
+}
+
+uci_bool() {
+	local option="$1"
+	local default="${2:-0}"
+	local value
+	value="$(uci_get "$option" "$default")"
+	case "$value" in
+		1|true|yes|on|enabled) printf '1\n' ;;
+		*) printf '0\n' ;;
+	esac
+}
+
+uci_list() {
+	local option="$1"
+	uci -q get "singbox_failover.main.$option" 2>/dev/null | tr ' ' '\n'
+}
+
+enabled() {
+	[ "$(uci_bool enabled 0)" = "1" ]
+}
+
+mode() {
+	case "$(uci_get mode auto)" in
+		auto|force_direct|force_proxy) uci_get mode auto ;;
+		*) printf 'auto\n' ;;
+	esac
+}
+
+interval() {
+	local value
+	value="$(uci_get check_interval 10)"
+	[ "$value" -ge 1 ] 2>/dev/null || value=10
+	printf '%s\n' "$value"
+}
+
+timeout_seconds() {
+	local value
+	value="$(uci_get timeout 2)"
+	[ "$value" -ge 1 ] 2>/dev/null || value=2
+	printf '%s\n' "$value"
+}
+
+fail_threshold() {
+	local value
+	value="$(uci_get fail_threshold 3)"
+	[ "$value" -ge 1 ] 2>/dev/null || value=3
+	printf '%s\n' "$value"
+}
+
+recover_threshold() {
+	local value
+	value="$(uci_get recover_threshold 6)"
+	[ "$value" -ge 1 ] 2>/dev/null || value=6
+	printf '%s\n' "$value"
+}
+
+validate_iface_name() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+resolve_device() {
+	local iface="$1"
+	local device
+
+	if ! validate_iface_name "$iface"; then
+		return 1
+	fi
+
+	device="$(ubus call "network.interface.$iface" status 2>/dev/null | jq -r '.l3_device // .device // empty' 2>/dev/null || true)"
+	if [ -n "$device" ] && validate_iface_name "$device"; then
+		printf '%s\n' "$device"
+	else
+		printf '%s\n' "$iface"
+	fi
+}
+
+source_devices() {
+	local iface device
+
+	uci_list source_interfaces | while IFS= read -r iface; do
+		[ -n "$iface" ] || continue
+		device="$(resolve_device "$iface")" || continue
+		printf '%s\n' "$device"
+	done | sort -u
+}
+
+health_urls() {
+	local urls
+	urls="$(uci_list health_url)"
+	if [ -n "$urls" ]; then
+		printf '%s\n' "$urls"
+	else
+		printf '%s\n' "https://www.gstatic.com/generate_204" "https://cp.cloudflare.com/generate_204"
+	fi
+}
+
+ensure_work_dir() {
+	mkdir -p "$WORK_DIR"
+}
+
+pid_running() {
+	local pid
+	[ -s "$PID_PATH" ] || return 1
+	pid="$(cat "$PID_PATH" 2>/dev/null || true)"
+	[ -n "$pid" ] || return 1
+	kill -0 "$pid" 2>/dev/null
+}
+
+write_status() {
+	local state="$1"
+	local direct="$2"
+	local proxy="$3"
+	local last_transition="$4"
+	local fail_count="$5"
+	local recover_count="$6"
+	local last_error="${7:-}"
+	local running="0"
+
+	ensure_work_dir
+	if pid_running; then
+		running="1"
+	fi
+
+	jq -n \
+		--arg enabled "$(uci_bool enabled 0)" \
+		--arg configured_mode "$(mode)" \
+		--arg current_mode "$state" \
+		--arg direct_result "$direct" \
+		--arg proxy_result "$proxy" \
+		--arg last_transition "$last_transition" \
+		--argjson fail_count "${fail_count:-0}" \
+		--argjson recover_count "${recover_count:-0}" \
+		--arg last_error "$last_error" \
+		--arg running "$running" \
+		--arg updated_at "$(date -Iseconds 2>/dev/null || date)" \
+		'{
+			enabled: ($enabled == "1"),
+			configured_mode: $configured_mode,
+			current_mode: $current_mode,
+			direct_result: $direct_result,
+			proxy_result: $proxy_result,
+			last_transition: $last_transition,
+			fail_count: $fail_count,
+			recover_count: $recover_count,
+			last_error: $last_error,
+			sing_box_running: ($running == "1"),
+			updated_at: $updated_at
+		}' > "$STATUS_PATH.tmp" && mv "$STATUS_PATH.tmp" "$STATUS_PATH"
+}
+
+status() {
+	if [ -s "$STATUS_PATH" ]; then
+		cat "$STATUS_PATH"
+	else
+		write_status "direct" "unknown" "unknown" "" 0 0 ""
+		cat "$STATUS_PATH"
+	fi
+}
+
+outbound_json() {
+	uci_get outbound_json ""
+}
+
+validate_outbound_json() {
+	local json
+	json="$(outbound_json)"
+
+	[ -n "$json" ] || {
+		printf '%s\n' "outbound_json is empty"
+		return 1
+	}
+
+	printf '%s' "$json" | jq -e 'type == "object" and (.type | type == "string")' >/dev/null 2>&1 || {
+		printf '%s\n' "outbound_json must be a sing-box outbound JSON object with type"
+		return 1
+	}
+}
+
+build_singbox_config() {
+	local json
+	json="$(outbound_json)"
+	ensure_work_dir
+
+	printf '%s' "$json" | jq \
+		--argjson tproxy_port "$TPROXY_PORT" \
+		--argjson mixed_port "$MIXED_PORT" \
+		'
+		. as $outbound
+		| {
+			log: {
+				level: "warn",
+				timestamp: true
+			},
+			inbounds: [
+				{
+					type: "tproxy",
+					tag: "tproxy-in",
+					listen: "127.0.0.1",
+					listen_port: $tproxy_port,
+					tcp_fast_open: true,
+					udp_fragment: true
+				},
+				{
+					type: "mixed",
+					tag: "mixed-in",
+					listen: "127.0.0.1",
+					listen_port: $mixed_port
+				}
+			],
+			outbounds: [
+				($outbound + { tag: "proxy-out" }),
+				{
+					type: "direct",
+					tag: "direct-out"
+				}
+			],
+			route: {
+				auto_detect_interface: true,
+				rules: [
+					{
+						inbound: "tproxy-in",
+						outbound: "proxy-out"
+					},
+					{
+						inbound: "mixed-in",
+						outbound: "proxy-out"
+					}
+				],
+				final: "direct-out"
+			}
+		}' > "$CONFIG_PATH"
+}
+
+check_config() {
+	local error
+	error="$(validate_outbound_json)" || {
+		printf '%s\n' "$error"
+		return 1
+	}
+
+	build_singbox_config || return 1
+	sing-box check -c "$CONFIG_PATH"
+}
+
+start_singbox() {
+	local error
+
+	error="$(validate_outbound_json)" || {
+		write_status "direct" "unknown" "not_configured" "" 0 0 "$error"
+		log "$error; leaving traffic direct"
+		return 1
+	}
+
+	build_singbox_config || return 1
+	if ! sing-box check -c "$CONFIG_PATH" >/tmp/singbox-failover-check.log 2>&1; then
+		error="$(cat /tmp/singbox-failover-check.log 2>/dev/null || true)"
+		write_status "direct" "unknown" "config_invalid" "" 0 0 "$error"
+		log "generated sing-box config is invalid; leaving traffic direct"
+		return 1
+	fi
+
+	if pid_running; then
+		return 0
+	fi
+
+	sing-box run -c "$CONFIG_PATH" -D "$WORK_DIR" >/tmp/singbox-failover-sing-box.log 2>&1 &
+	echo "$!" > "$PID_PATH"
+	sleep 1
+
+	if ! pid_running; then
+		error="$(cat /tmp/singbox-failover-sing-box.log 2>/dev/null || true)"
+		write_status "direct" "unknown" "start_failed" "" 0 0 "$error"
+		log "sing-box instance failed to start; leaving traffic direct"
+		return 1
+	fi
+}
+
+stop_singbox() {
+	local pid
+	if [ -s "$PID_PATH" ]; then
+		pid="$(cat "$PID_PATH" 2>/dev/null || true)"
+		if [ -n "$pid" ]; then
+			kill "$pid" 2>/dev/null || true
+			sleep 1
+			kill -9 "$pid" 2>/dev/null || true
+		fi
+	fi
+	rm -f "$PID_PATH"
+}
+
+ensure_route_table_name() {
+	local line="$ROUTE_TABLE $ROUTE_TABLE_NAME"
+
+	[ -f /etc/iproute2/rt_tables ] || return 0
+	grep -Eq "^[[:space:]]*$ROUTE_TABLE[[:space:]]+$ROUTE_TABLE_NAME([[:space:]]|$)" /etc/iproute2/rt_tables 2>/dev/null && return 0
+	printf '%s\n' "$line" >> /etc/iproute2/rt_tables
+}
+
+remove_ip_rules() {
+	while ip rule del fwmark "$MARK/$MARK" lookup "$ROUTE_TABLE" priority "$RULE_PRIORITY" 2>/dev/null; do
+		:
+	done
+	ip route flush table "$ROUTE_TABLE" 2>/dev/null || true
+}
+
+cleanup_rules() {
+	nft delete table inet "$TABLE_NAME" 2>/dev/null || true
+	remove_ip_rules
+}
+
+cleanup() {
+	cleanup_rules
+	stop_singbox
+	write_status "direct" "unknown" "unknown" "" 0 0 ""
+}
+
+clear_conntrack_note() {
+	if command -v conntrack >/dev/null 2>&1; then
+		log "conntrack command is available, but per-interface cleanup is not enabled in MVP"
+	else
+		log "conntrack command is unavailable; existing client sessions may reconnect on their own"
+	fi
+}
+
+apply_proxy_rules() {
+	local device devices nft_file
+
+	devices="$(source_devices)"
+	if [ -z "$devices" ]; then
+		log "no source interfaces configured; leaving traffic direct"
+		return 1
+	fi
+
+	ensure_route_table_name
+	ip route replace local 0.0.0.0/0 dev lo table "$ROUTE_TABLE"
+	ip rule add fwmark "$MARK/$MARK" lookup "$ROUTE_TABLE" priority "$RULE_PRIORITY" 2>/dev/null || true
+
+	nft_file="$WORK_DIR/rules.nft"
+	ensure_work_dir
+	{
+		printf 'table inet %s {\n' "$TABLE_NAME"
+		printf '  set localv4 {\n'
+		printf '    type ipv4_addr\n'
+		printf '    flags interval\n'
+		printf '    elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/3 }\n'
+		printf '  }\n'
+		printf '  chain prerouting {\n'
+		printf '    type filter hook prerouting priority mangle; policy accept;\n'
+		printf '    ip daddr @localv4 return\n'
+		printf '    ct status dnat return\n'
+		printf '    meta mark & %s == %s return\n' "$MARK" "$MARK"
+		printf '%s\n' "$devices" | while IFS= read -r device; do
+			validate_iface_name "$device" || continue
+			printf '    iifname "%s" ip protocol tcp meta mark set %s tproxy ip to 127.0.0.1:%s accept\n' "$device" "$MARK" "$TPROXY_PORT"
+			printf '    iifname "%s" ip protocol udp meta mark set %s tproxy ip to 127.0.0.1:%s accept\n' "$device" "$MARK" "$TPROXY_PORT"
+		done
+		printf '  }\n'
+		printf '}\n'
+	} > "$nft_file"
+
+	nft -f "$nft_file"
+}
+
+set_direct() {
+	cleanup_rules
+}
+
+set_proxy() {
+	start_singbox || return 1
+	apply_proxy_rules || return 1
+	clear_conntrack_note
+}
+
+curl_code() {
+	local url="$1"
+	local iface_arg="$2"
+	local proxy_arg="$3"
+	local timeout
+	timeout="$(timeout_seconds)"
+
+	if [ -n "$proxy_arg" ]; then
+		curl -L -sS -o /dev/null -w '%{http_code}' --connect-timeout "$timeout" --max-time "$timeout" -x "$proxy_arg" "$url" 2>/dev/null || true
+	elif [ -n "$iface_arg" ]; then
+		curl -L -sS -o /dev/null -w '%{http_code}' --connect-timeout "$timeout" --max-time "$timeout" --interface "$iface_arg" "$url" 2>/dev/null || true
+	else
+		curl -L -sS -o /dev/null -w '%{http_code}' --connect-timeout "$timeout" --max-time "$timeout" "$url" 2>/dev/null || true
+	fi
+}
+
+http_code_ok() {
+	case "$1" in
+		2??|3??) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+test_direct() {
+	local wan iface url code
+
+	wan="$(uci_get wan_interface wan)"
+	iface="$(resolve_device "$wan")" || iface="$wan"
+
+	for url in $(health_urls); do
+		[ -n "$url" ] || continue
+		code="$(curl_code "$url" "$iface" "")"
+		if http_code_ok "$code"; then
+			jq -n --arg ok "1" --arg url "$url" --arg interface "$iface" --arg code "$code" '{ok: ($ok == "1"), url: $url, interface: $interface, http_code: $code}'
+			return 0
+		fi
+	done
+
+	jq -n --arg ok "0" --arg interface "$iface" '{ok: ($ok == "1"), interface: $interface, error: "all health URLs failed"}'
+	return 1
+}
+
+test_proxy() {
+	local url code proxy
+
+	proxy="http://127.0.0.1:$MIXED_PORT"
+
+	if ! pid_running; then
+		start_singbox || {
+			jq -n '{ok: false, error: "sing-box instance is not running"}'
+			return 1
+		}
+	fi
+
+	for url in $(health_urls); do
+		[ -n "$url" ] || continue
+		code="$(curl_code "$url" "" "$proxy")"
+		if http_code_ok "$code"; then
+			jq -n --arg ok "1" --arg url "$url" --arg proxy "$proxy" --arg code "$code" '{ok: ($ok == "1"), url: $url, proxy: $proxy, http_code: $code}'
+			return 0
+		fi
+	done
+
+	jq -n --arg ok "0" --arg proxy "$proxy" '{ok: ($ok == "1"), proxy: $proxy, error: "all health URLs failed"}'
+	return 1
+}
+
+daemon_loop() {
+	local state="direct"
+	local direct_ok="unknown"
+	local proxy_ok="unknown"
+	local fails=0
+	local recovers=0
+	local last_transition=""
+	local current_mode
+
+	trap 'cleanup; exit 0' INT TERM
+
+	if ! enabled; then
+		cleanup
+		log "disabled in UCI; exiting"
+		return 0
+	fi
+
+	current_mode="$(mode)"
+	case "$current_mode" in
+		force_direct)
+			set_direct
+			write_status "direct" "unknown" "unused" "$last_transition" 0 0 ""
+			;;
+		force_proxy)
+			if set_proxy; then
+				state="proxy"
+				last_transition="$(date -Iseconds 2>/dev/null || date)"
+				log "forced proxy mode enabled"
+				write_status "$state" "unknown" "unknown" "$last_transition" 0 0 ""
+			else
+				set_direct
+				return 1
+			fi
+			;;
+		auto)
+			start_singbox || return 1
+			set_direct
+			write_status "direct" "unknown" "unknown" "$last_transition" 0 0 ""
+			;;
+	esac
+
+	while enabled; do
+		current_mode="$(mode)"
+
+		case "$current_mode" in
+			force_direct)
+				[ "$state" = "direct" ] || {
+					set_direct
+					state="direct"
+					last_transition="$(date -Iseconds 2>/dev/null || date)"
+					log "transition to direct by force_direct"
+				}
+				write_status "$state" "forced" "unused" "$last_transition" 0 0 ""
+				sleep "$(interval)"
+				continue
+				;;
+			force_proxy)
+				if [ "$state" != "proxy" ]; then
+					if set_proxy; then
+						state="proxy"
+						last_transition="$(date -Iseconds 2>/dev/null || date)"
+						log "transition to proxy by force_proxy"
+					else
+						set_direct
+						write_status "direct" "unknown" "failed" "$last_transition" "$fails" "$recovers" "proxy activation failed"
+						sleep "$(interval)"
+						continue
+					fi
+				fi
+				write_status "$state" "forced" "forced" "$last_transition" 0 0 ""
+				sleep "$(interval)"
+				continue
+				;;
+		esac
+
+		if test_direct >/dev/null 2>&1; then
+			direct_ok="ok"
+			fails=0
+			recovers=$((recovers + 1))
+		else
+			direct_ok="fail"
+			fails=$((fails + 1))
+			recovers=0
+		fi
+
+		if [ "$state" = "direct" ] && [ "$fails" -ge "$(fail_threshold)" ]; then
+			if test_proxy >/dev/null 2>&1 && set_proxy; then
+				proxy_ok="ok"
+				state="proxy"
+				last_transition="$(date -Iseconds 2>/dev/null || date)"
+				log "transition to proxy after $fails failed direct checks"
+				fails=0
+				recovers=0
+			else
+				proxy_ok="fail"
+				set_direct
+				log "proxy check failed; leaving traffic direct"
+			fi
+		fi
+
+		if [ "$state" = "proxy" ] && [ "$recovers" -ge "$(recover_threshold)" ]; then
+			set_direct
+			state="direct"
+			last_transition="$(date -Iseconds 2>/dev/null || date)"
+			log "transition to direct after $recovers successful direct checks"
+			fails=0
+			recovers=0
+		fi
+
+		write_status "$state" "$direct_ok" "$proxy_ok" "$last_transition" "$fails" "$recovers" ""
+		sleep "$(interval)"
+	done
+
+	cleanup
+	log "disabled in UCI; stopped"
+}
+
+case "${1:-status}" in
+	daemon)
+		daemon_loop
+		;;
+	cleanup)
+		cleanup
+		;;
+	status)
+		status
+		;;
+	test_direct)
+		test_direct
+		;;
+	test_proxy)
+		test_proxy
+		;;
+	check_config)
+		check_config
+		;;
+	*)
+		printf 'Usage: %s {daemon|cleanup|status|test_direct|test_proxy|check_config}\n' "$0" >&2
+		exit 2
+		;;
+esac

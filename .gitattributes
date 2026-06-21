@@ -1,0 +1,10 @@
+* text=auto
+*.sh text eol=lf
+Makefile text eol=lf
+singbox-failover/files/usr/bin/singbox-failover text eol=lf
+singbox-failover/files/etc/init.d/singbox-failover text eol=lf
+singbox-failover/files/etc/config/singbox_failover text eol=lf
+*.json text eol=lf
+*.js text eol=lf
+*.yml text eol=lf
+

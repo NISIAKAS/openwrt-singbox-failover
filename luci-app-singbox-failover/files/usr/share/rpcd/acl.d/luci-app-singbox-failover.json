@@ -1,0 +1,19 @@
+{
+  "luci-app-singbox-failover": {
+    "description": "Grant access to sing-box failover configuration and actions",
+    "read": {
+      "uci": [ "singbox_failover" ],
+      "file": {
+        "/usr/bin/singbox-failover": [ "exec" ]
+      }
+    },
+    "write": {
+      "uci": [ "singbox_failover" ],
+      "file": {
+        "/usr/bin/singbox-failover": [ "exec" ],
+        "/etc/init.d/singbox-failover": [ "exec" ]
+      }
+    }
+  }
+}
+

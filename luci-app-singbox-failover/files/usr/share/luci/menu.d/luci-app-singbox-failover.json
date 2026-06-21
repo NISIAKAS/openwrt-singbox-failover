@@ -1,0 +1,17 @@
+{
+  "admin/services/singbox-failover": {
+    "title": "Sing-box Failover",
+    "order": 43,
+    "action": {
+      "type": "view",
+      "path": "singbox-failover"
+    },
+    "depends": {
+      "acl": [ "luci-app-singbox-failover" ],
+      "uci": {
+        "singbox_failover": true
+      }
+    }
+  }
+}
+
