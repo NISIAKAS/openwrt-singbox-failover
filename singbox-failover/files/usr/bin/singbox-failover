@@ -80,6 +80,20 @@ recover_threshold() {
 	printf '%s\n' "$value"
 }
 
+health_policy() {
+	case "$(uci_get health_policy any_ok)" in
+		any_ok|all_ok|quorum) uci_get health_policy any_ok ;;
+		*) printf 'any_ok\n' ;;
+	esac
+}
+
+health_quorum() {
+	local value
+	value="$(uci_get health_quorum 1)"
+	[ "$value" -ge 1 ] 2>/dev/null || value=1
+	printf '%s\n' "$value"
+}
+
 validate_iface_name() {
 	case "$1" in
 		''|*[!A-Za-z0-9_.:-]*) return 1 ;;
@@ -135,6 +149,55 @@ pid_running() {
 	kill -0 "$pid" 2>/dev/null
 }
 
+dataplane_json() {
+	local nft_table="0"
+	local fwmark_rule="0"
+	local route_table_active="0"
+	local tproxy_port="0"
+	local mixed_port="0"
+
+	if nft list table inet "$TABLE_NAME" >/dev/null 2>&1; then
+		nft_table="1"
+	fi
+	if ip rule show 2>/dev/null | grep -Eq "fwmark 0x200000/0x200000.*lookup $ROUTE_TABLE"; then
+		fwmark_rule="1"
+	fi
+	if ip route show table "$ROUTE_TABLE" 2>/dev/null | grep -q .; then
+		route_table_active="1"
+	fi
+	if netstat -lnp 2>/dev/null | grep -q "127.0.0.1:$TPROXY_PORT"; then
+		tproxy_port="1"
+	fi
+	if netstat -lnp 2>/dev/null | grep -q "127.0.0.1:$MIXED_PORT"; then
+		mixed_port="1"
+	fi
+
+	jq -n \
+		--arg nft_table "$nft_table" \
+		--arg fwmark_rule "$fwmark_rule" \
+		--arg route_table_active "$route_table_active" \
+		--arg tproxy_port "$tproxy_port" \
+		--arg mixed_port "$mixed_port" \
+		--arg table_name "$TABLE_NAME" \
+		--arg mark "$MARK" \
+		--arg route_table "$ROUTE_TABLE" \
+		--argjson tproxy_port_number "$TPROXY_PORT" \
+		--argjson mixed_port_number "$MIXED_PORT" \
+		'{
+			nft_table: ($nft_table == "1"),
+			fwmark_rule: ($fwmark_rule == "1"),
+			route_table_active: ($route_table_active == "1"),
+			tproxy_port: ($tproxy_port == "1"),
+			mixed_port: ($mixed_port == "1"),
+			table_name: $table_name,
+			fwmark: $mark,
+			route_table: $route_table,
+			tproxy_port_number: $tproxy_port_number,
+			mixed_port_number: $mixed_port_number,
+			rules_active: (($nft_table == "1") and ($fwmark_rule == "1") and ($route_table_active == "1"))
+		}'
+}
+
 write_status() {
 	local state="$1"
 	local direct="$2"
@@ -144,15 +207,27 @@ write_status() {
 	local recover_count="$6"
 	local last_error="${7:-}"
 	local running="0"
+	local direct_health="null"
+	local proxy_health="null"
+	local dataplane
 
 	ensure_work_dir
 	if pid_running; then
 		running="1"
 	fi
+	if [ -s "$WORK_DIR/last_direct.json" ]; then
+		direct_health="$(cat "$WORK_DIR/last_direct.json" 2>/dev/null || printf 'null')"
+	fi
+	if [ -s "$WORK_DIR/last_proxy.json" ]; then
+		proxy_health="$(cat "$WORK_DIR/last_proxy.json" 2>/dev/null || printf 'null')"
+	fi
+	dataplane="$(dataplane_json)"
 
 	jq -n \
 		--arg enabled "$(uci_bool enabled 0)" \
 		--arg configured_mode "$(mode)" \
+		--arg health_policy "$(health_policy)" \
+		--argjson health_quorum "$(health_quorum)" \
 		--arg current_mode "$state" \
 		--arg direct_result "$direct" \
 		--arg proxy_result "$proxy" \
@@ -161,10 +236,15 @@ write_status() {
 		--argjson recover_count "${recover_count:-0}" \
 		--arg last_error "$last_error" \
 		--arg running "$running" \
+		--argjson direct_health "$direct_health" \
+		--argjson proxy_health "$proxy_health" \
+		--argjson dataplane "$dataplane" \
 		--arg updated_at "$(date -Iseconds 2>/dev/null || date)" \
 		'{
 			enabled: ($enabled == "1"),
 			configured_mode: $configured_mode,
+			health_policy: $health_policy,
+			health_quorum: $health_quorum,
 			current_mode: $current_mode,
 			direct_result: $direct_result,
 			proxy_result: $proxy_result,
@@ -173,13 +253,25 @@ write_status() {
 			recover_count: $recover_count,
 			last_error: $last_error,
 			sing_box_running: ($running == "1"),
+			dataplane: $dataplane,
+			direct_health: $direct_health,
+			proxy_health: $proxy_health,
 			updated_at: $updated_at
 		}' > "$STATUS_PATH.tmp" && mv "$STATUS_PATH.tmp" "$STATUS_PATH"
 }
 
 status() {
+	local dataplane running="0"
+
 	if [ -s "$STATUS_PATH" ]; then
-		cat "$STATUS_PATH"
+		if pid_running; then
+			running="1"
+		fi
+		dataplane="$(dataplane_json)"
+		jq \
+			--arg running "$running" \
+			--argjson dataplane "$dataplane" \
+			'.sing_box_running = ($running == "1") | .dataplane = $dataplane' "$STATUS_PATH"
 	else
 		write_status "direct" "unknown" "unknown" "" 0 0 ""
 		cat "$STATUS_PATH"
@@ -423,27 +515,89 @@ http_code_ok() {
 	esac
 }
 
+health_required() {
+	local policy="$1"
+	local total="$2"
+
+	case "$policy" in
+		all_ok) printf '%s\n' "$total" ;;
+		quorum) health_quorum ;;
+		*) printf '1\n' ;;
+	esac
+}
+
+run_healthcheck() {
+	local target="$1"
+	local iface="$2"
+	local proxy="$3"
+	local url code ok tmp total=0 passed=0 failed=0 required policy result_path
+
+	ensure_work_dir
+	tmp="$WORK_DIR/check-$target.jsonl"
+	: > "$tmp"
+
+	for url in $(health_urls); do
+		[ -n "$url" ] || continue
+		total=$((total + 1))
+		code="$(curl_code "$url" "$iface" "$proxy")"
+		if http_code_ok "$code"; then
+			ok="1"
+			passed=$((passed + 1))
+		else
+			ok="0"
+			failed=$((failed + 1))
+		fi
+		jq -n \
+			--arg url "$url" \
+			--arg code "$code" \
+			--arg ok "$ok" \
+			'{url: $url, http_code: $code, ok: ($ok == "1")}' >> "$tmp"
+	done
+
+	policy="$(health_policy)"
+	required="$(health_required "$policy" "$total")"
+	[ "$required" -ge 1 ] 2>/dev/null || required=1
+
+	result_path="$WORK_DIR/last_$target.json"
+	jq -s \
+		--arg target "$target" \
+		--arg policy "$policy" \
+		--argjson required "$required" \
+		--argjson total "$total" \
+		--argjson passed "$passed" \
+		--argjson failed "$failed" \
+		--arg interface "$iface" \
+		--arg proxy "$proxy" \
+		--arg updated_at "$(date -Iseconds 2>/dev/null || date)" \
+		'{
+			ok: ($total > 0 and $passed >= $required),
+			target: $target,
+			policy: $policy,
+			required: $required,
+			total: $total,
+			passed: $passed,
+			failed: $failed,
+			interface: (if $interface == "" then null else $interface end),
+			proxy: (if $proxy == "" then null else $proxy end),
+			updated_at: $updated_at,
+			checks: .
+		}' "$tmp" > "$result_path"
+
+	cat "$result_path"
+	[ "$total" -gt 0 ] && [ "$passed" -ge "$required" ]
+}
+
 test_direct() {
-	local wan iface url code
+	local wan iface
 
 	wan="$(uci_get wan_interface wan)"
 	iface="$(resolve_device "$wan")" || iface="$wan"
 
-	for url in $(health_urls); do
-		[ -n "$url" ] || continue
-		code="$(curl_code "$url" "$iface" "")"
-		if http_code_ok "$code"; then
-			jq -n --arg ok "1" --arg url "$url" --arg interface "$iface" --arg code "$code" '{ok: ($ok == "1"), url: $url, interface: $interface, http_code: $code}'
-			return 0
-		fi
-	done
-
-	jq -n --arg ok "0" --arg interface "$iface" '{ok: ($ok == "1"), interface: $interface, error: "all health URLs failed"}'
-	return 1
+	run_healthcheck "direct" "$iface" ""
 }
 
 test_proxy() {
-	local url code proxy
+	local proxy
 
 	proxy="http://127.0.0.1:$MIXED_PORT"
 
@@ -454,17 +608,7 @@ test_proxy() {
 		}
 	fi
 
-	for url in $(health_urls); do
-		[ -n "$url" ] || continue
-		code="$(curl_code "$url" "" "$proxy")"
-		if http_code_ok "$code"; then
-			jq -n --arg ok "1" --arg url "$url" --arg proxy "$proxy" --arg code "$code" '{ok: ($ok == "1"), url: $url, proxy: $proxy, http_code: $code}'
-			return 0
-		fi
-	done
-
-	jq -n --arg ok "0" --arg proxy "$proxy" '{ok: ($ok == "1"), proxy: $proxy, error: "all health URLs failed"}'
-	return 1
+	run_healthcheck "proxy" "" "$proxy"
 }
 
 daemon_loop() {

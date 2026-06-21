@@ -9,5 +9,6 @@ config settings 'main'
 	option timeout '2'
 	option fail_threshold '3'
 	option recover_threshold '6'
+	option health_policy 'any_ok'
+	option health_quorum '1'
 	option outbound_json ''
-

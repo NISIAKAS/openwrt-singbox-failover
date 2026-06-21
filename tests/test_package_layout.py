@@ -47,6 +47,8 @@ class PackageLayoutTests(unittest.TestCase):
         self.assertRegex(config, r"option\s+mode\s+'auto'")
         self.assertRegex(config, r"option\s+wan_interface\s+'wan'")
         self.assertRegex(config, r"list\s+source_interfaces\s+'miners'")
+        self.assertRegex(config, r"option\s+health_policy\s+'any_ok'")
+        self.assertRegex(config, r"option\s+health_quorum\s+'1'")
         self.assertRegex(config, r"option\s+outbound_json\s+''")
 
     def test_runtime_uses_isolated_ports_marks_and_table(self):
@@ -73,12 +75,45 @@ class PackageLayoutTests(unittest.TestCase):
 
     def test_luci_view_exposes_required_tabs_and_actions(self):
         view = read("luci-app-singbox-failover/files/www/luci-static/resources/view/singbox-failover.js")
-        for label in ["General", "Outbound", "Healthchecks", "Status", "Actions"]:
+        for label in ["Основное", "Исходящее соединение", "Проверки доступности", "Статус", "Действия"]:
             self.assertIn(label, view)
         for command in ["test_direct", "test_proxy", "start", "stop", "reload"]:
             self.assertIn(command, view)
         self.assertIn("outbound_json", view)
         self.assertRegex(view, r"JSON\.parse")
+
+    def test_healthcheck_policy_is_exposed_in_runtime_and_luci(self):
+        script = read("singbox-failover/files/usr/bin/singbox-failover")
+        view = read("luci-app-singbox-failover/files/www/luci-static/resources/view/singbox-failover.js")
+
+        for token in ["health_policy", "health_quorum", "any_ok", "all_ok", "quorum"]:
+            self.assertIn(token, script)
+            self.assertIn(token, view)
+        self.assertIn("direct_health", script)
+        self.assertIn("proxy_health", script)
+        self.assertIn("Обновить статус", view)
+
+    def test_status_dashboard_exposes_dataplane_state(self):
+        script = read("singbox-failover/files/usr/bin/singbox-failover")
+        view = read("luci-app-singbox-failover/files/www/luci-static/resources/view/singbox-failover.js")
+
+        for token in ["dataplane_json", "rules_active", "fwmark_rule", "route_table_active"]:
+            self.assertIn(token, script)
+        for token in ["dashboard(status)", "Правила и порты", "statusCard", "dataplaneRows"]:
+            self.assertIn(token, view)
+
+    def test_luci_view_has_russian_helpful_labels(self):
+        view = read("luci-app-singbox-failover/files/www/luci-static/resources/view/singbox-failover.js")
+        for token in [
+            "Прямой доступ",
+            "Правила маршрутизации",
+            "Отдельный sing-box",
+            "Адреса, по которым проверяется direct-доступ",
+            "Не вставляй полный Xray/V2Ray config",
+            "Проверить direct",
+            "Проверить proxy",
+        ]:
+            self.assertIn(token, view)
 
     def test_luci_view_uses_network_select_for_interfaces(self):
         view = read("luci-app-singbox-failover/files/www/luci-static/resources/view/singbox-failover.js")
